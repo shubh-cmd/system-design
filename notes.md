@@ -176,6 +176,277 @@ Do not use Redis as the only store for:
 
 ## Interview-ready answer
 
+---
+
+
 “If I need relational integrity, joins, and transactions, I’d choose PostgreSQL or MySQL. If the data is document-shaped and evolving, I’d choose MongoDB. If I’m on AWS and want a fully managed database with predictable access patterns, I’d choose DynamoDB. If the workload is extremely write-heavy and distributed across regions, Cassandra is a strong fit. And if I need very fast caching, sessions, or counters, Redis is the right tool.”
 
 If you want, I can next give you a **single comparison table for all 6**, or a **system-design scenario guide** like “what database for chat app, ecommerce, analytics, social feed, leaderboard, and session management.”
+
+
+## Cassandra row update
+
+This sentence is describing a core trade-off in Cassandra’s storage engine.
+
+Cassandra is built on an LSM-style write path, which means it does **not** overwrite the old value in place when you update a row. Instead, it appends a new version of the data with a newer timestamp. That makes writes fast, but it creates extra work later for reads and storage cleanup.
+
+## What happens on an update?
+
+Suppose a row starts like this:
+
+```text
+user_id = 42, status = "active"
+```
+
+Later, you update it:
+
+```text
+user_id = 42, status = "inactive"
+```
+
+In a traditional in-place storage engine, the database may go to the old record and replace `"active"` with `"inactive"`.
+
+In Cassandra, the update is treated more like:
+
+- keep the old version
+- append a new version
+- mark the new one as the latest based on timestamp
+
+So now Cassandra may have multiple versions of the same row spread across different SSTables.
+
+## Why are SSTables involved?
+
+Cassandra writes data in a sequence like this:
+
+1. write goes to the commit log for durability
+2. write goes to the memtable in memory
+3. memtable flushes to disk as an SSTable
+4. future updates create more SSTables over time
+
+Because SSTables are immutable, Cassandra does not edit them in place. That is why a frequently updated row can end up scattered across many SSTables.
+
+## What does “newer timestamp” mean?
+
+Cassandra uses timestamps to decide which value is the latest version of a cell or row.
+
+If one SSTable has:
+
+- `status = "active"` at time `100`
+
+and another has:
+
+- `status = "inactive"` at time `200`
+
+then Cassandra knows `"inactive"` wins, because it has the newer timestamp.
+
+So the database may store both values temporarily, but only one is considered current.
+
+## Why does this hurt reads?
+
+When you read a row, Cassandra may have to check multiple SSTables to reconstruct the latest version.
+
+That means it may need to:
+
+- look in SSTable A
+- look in SSTable B
+- look in SSTable C
+- compare timestamps
+- ignore older overwritten values
+- return only the newest visible data
+
+This extra work is called **read amplification**.
+
+### Read amplification means:
+A single logical read turns into many physical disk checks.
+
+The more updates a row has, the more SSTables may contain old versions of that row, and the slower reads can become.
+
+## Why does it waste space?
+
+Until compaction runs, old overwritten versions still exist on disk.
+
+So if a row is updated many times:
+
+- old versions are still stored
+- newer versions are also stored
+- disk usage grows
+- space is not reclaimed immediately
+
+This is what the text means by “wastes space until compaction consolidates them.”
+
+## What is compaction doing?
+
+Compaction is the cleanup process.
+
+It merges SSTables together and:
+
+- keeps the newest version of each key
+- drops overwritten values
+- removes data that is no longer needed
+- writes cleaner SSTables back to disk
+
+So compaction reduces:
+
+- read amplification
+- disk waste
+- the number of SSTables a read must scan
+
+## A simple example
+
+Imagine one user profile gets updated 5 times:
+
+- `name = "A"` in SSTable 1
+- `name = "B"` in SSTable 2
+- `name = "C"` in SSTable 3
+- `name = "D"` in SSTable 4
+- `name = "E"` in SSTable 5
+
+Before compaction, a read may need to inspect several SSTables to find the latest value.
+
+After compaction, Cassandra can merge those versions and keep only:
+
+- `name = "E"`
+
+## Why this matters in practice
+
+This is why Cassandra is great for:
+
+- append-heavy workloads
+- time-series data
+- logs
+- events
+- messages
+
+and weaker for workloads that:
+
+- update the same rows repeatedly
+- overwrite a lot of fields frequently
+- need low-latency reads on heavily updated records
+
+## In one line
+
+Cassandra is optimized for fast writes by appending new versions instead of updating in place, but repeated updates make reads more expensive until compaction cleans up the old versions.
+
+If you want, I can also explain this with a **visual timeline**, or compare it with how **PostgreSQL/MySQL** handle updates.
+
+
+Sure.
+
+## Memtable
+
+A **memtable** is Cassandra’s in-memory write buffer.
+
+When a write comes in, Cassandra does not immediately put it into a big on-disk table. Instead, it first:
+
+1. appends the write to the **commit log** for durability
+2. stores the write in the **memtable** in memory
+
+The memtable is basically the current working set of recent writes.
+
+### Why it exists
+- It makes writes fast
+- It avoids constant random disk writes
+- It lets Cassandra batch many writes before flushing to disk
+
+### What happens next
+When the memtable gets full, Cassandra flushes it to disk and turns it into an SSTable.
+
+---
+
+## SSTable
+
+**SSTable** stands for **Sorted String Table**.
+
+It is an immutable on-disk file that stores data in sorted order.
+
+### Key idea
+Once Cassandra writes data into an SSTable, it does **not** modify that file.
+
+If new updates arrive, they go into a new memtable, and later into a new SSTable.
+
+### Why it exists
+- Sorted data makes lookups efficient
+- Immutable files are simpler and faster to manage
+- Writes can be append-like instead of in-place updates
+
+### What SSTables contain
+An SSTable usually includes:
+- the actual data
+- an index
+- metadata
+- sometimes a summary or bloom filter to speed up lookups
+
+---
+
+## How memtable and SSTable work together
+
+A write flows like this:
+
+```text
+Client write
+   -> Commit log
+   -> Memtable
+   -> Flush
+   -> SSTable on disk
+```
+
+A read may check:
+- memtable first
+- then one or more SSTables
+
+Because of this, Cassandra can serve recent writes even before they are flushed to disk.
+
+---
+
+## What is “representation”?
+
+I think you may mean **representation of data** in Cassandra, but the word is a bit ambiguous. In this context, it usually means how Cassandra stores a row internally across memtables and SSTables.
+
+### Logical representation
+From your application’s point of view, you see:
+- rows
+- columns
+- primary key
+- partition key
+- clustering columns
+
+### Physical representation
+Internally, Cassandra may represent the same logical row as:
+- one version in memtable
+- another version in one SSTable
+- another older version in another SSTable
+
+So the “representation” of the data is split across memory and disk, not stored as one single mutable row like in some relational databases.
+
+---
+
+## Simple example
+
+Suppose you update a user’s status multiple times:
+
+- `active`
+- `inactive`
+- `active again`
+
+Cassandra may store these as multiple versions across different SSTables. The newest timestamp wins.
+
+So the physical representation is versioned, while the logical result looks like one current row.
+
+---
+
+## Why this design matters
+
+This design gives Cassandra:
+- very fast writes
+- good horizontal scale
+- predictable append-heavy performance
+
+But it also causes:
+- read amplification
+- compaction work
+- tombstones for deletes
+- more operational complexity
+
+If you want, I can next explain:
+1. **commit log vs memtable vs SSTable**, or  
+2. **how a read works in Cassandra step by step**.

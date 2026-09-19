@@ -450,3 +450,162 @@ But it also causes:
 If you want, I can next explain:
 1. **commit log vs memtable vs SSTable**, or  
 2. **how a read works in Cassandra step by step**.
+
+
+##
+
+This code defines a **Cassandra table for time-series sensor data**, and it uses **time bucketing** to keep partitions small and efficient.
+
+```sql
+CREATE TABLE sensor_readings (
+    sensor_id TEXT,
+    day DATE,
+    reading_time TIMESTAMP,
+    value DOUBLE,
+    PRIMARY KEY ((sensor_id, day), reading_time)
+);
+```
+
+## What each column means
+
+- **sensor_id TEXT**  
+  Identifies which sensor produced the reading.
+
+- **day DATE**  
+  A bucket column that groups readings by day.
+
+- **reading_time TIMESTAMP**  
+  The exact time the reading was taken.
+
+- **value DOUBLE**  
+  The actual sensor value, like temperature or humidity.
+
+---
+
+## What the primary key means
+
+The key part is:
+
+```sql
+PRIMARY KEY ((sensor_id, day), reading_time)
+```
+
+This has two parts:
+
+### 1. Partition key: `(sensor_id, day)`
+This means all readings for:
+- one specific sensor
+- on one specific day
+
+go into the same partition.
+
+So if `sensor_id = S1` and `day = 2024-01-15`, all readings for that sensor on that day are stored together.
+
+### 2. Clustering column: `reading_time`
+Inside that partition, rows are ordered by `reading_time`.
+
+So readings for the same sensor and day are stored in time order, which makes range queries efficient.
+
+---
+
+## Why this design is good
+
+This is a classic Cassandra pattern for time-series data.
+
+### It prevents unbounded partitions
+If you used only `sensor_id` as the partition key, then all history for one sensor would go into one giant partition. Over time that partition could become too large and slow.
+
+By adding `day`, Cassandra creates a separate partition for each sensor per day, which keeps partitions small and manageable.
+
+### It supports time-based queries
+This design is ideal for queries like:
+
+```sql
+SELECT * FROM sensor_readings
+WHERE sensor_id = 'S1' AND day = '2024-01-15';
+```
+
+or:
+
+```sql
+SELECT * FROM sensor_readings
+WHERE sensor_id = 'S1'
+  AND day = '2024-01-15'
+  AND reading_time >= '2024-01-15 10:00:00'
+  AND reading_time <= '2024-01-15 11:00:00';
+```
+
+These queries are efficient because they target one partition and then scan rows in sorted order.
+
+---
+
+## What this table is optimized for
+
+This schema is good when:
+- readings arrive continuously
+- you usually query data by sensor and time range
+- older data can be bucketed by day
+- you want predictable, fast reads and writes
+
+Typical use cases:
+- IoT sensor data
+- metrics
+- telemetry
+- logs
+- event streams
+
+---
+
+## Why `day` is important
+
+The `day` column is not just extra data, it is a **partitioning strategy**.
+
+It helps solve a common Cassandra problem, which is **partition growth**.
+
+Without it:
+- one sensor could accumulate millions of rows in one partition
+
+With it:
+- each day becomes its own bounded partition
+- compaction and reads stay more efficient
+
+---
+
+## How the data is organized
+
+For example:
+
+- `S1, 2024-01-15, 10:00`
+- `S1, 2024-01-15, 10:05`
+- `S1, 2024-01-15, 10:10`
+
+These all go into one partition.
+
+Then:
+- `S1, 2024-01-16, 09:00`
+
+goes into a different partition.
+
+So Cassandra stores the same sensor’s data in daily chunks.
+
+---
+
+## One important interview point
+
+This schema works because it matches the query pattern.
+
+Cassandra is query-first, so you design the table around how you will read the data:
+- partition by `sensor_id + day`
+- order within the partition by `reading_time`
+
+That gives you efficient writes and time-range reads.
+
+---
+
+## In one sentence
+
+This table stores readings per sensor per day in a single partition, with readings sorted by time, so Cassandra can handle time-series data efficiently without creating huge partitions.
+
+If you want, I can also explain:
+1. **why double parentheses are used in the primary key**, or  
+2. **how to query this table correctly in Cassandra**.

@@ -609,3 +609,401 @@ This table stores readings per sensor per day in a single partition, with readin
 If you want, I can also explain:
 1. **why double parentheses are used in the primary key**, or  
 2. **how to query this table correctly in Cassandra**.
+
+
+##
+
+This snippet shows the four common `Cache-Control` policies and how they affect who can cache a response, for how long, and whether the cached copy can be reused without asking the server again.
+
+`Cache-Control` is an HTTP response header that tells browsers, CDNs, and proxies what they are allowed to do with the response. In interviews, this is usually discussed as part of HTTP caching and conditional requests, often alongside `ETag` and `304 Not Modified`.
+
+### 1. `Cache-Control: public, max-age=3600`
+
+This means the response can be cached by **any cache**, including shared caches like CDNs or reverse proxies.
+
+- `public` means it is okay for shared caches to store it.
+- `max-age=3600` means the response is considered fresh for **3600 seconds**, which is 1 hour.
+
+So if this is a product catalog page or some other non-personalized data, a CDN can serve it directly for an hour without contacting your origin server again.
+
+### 2. `Cache-Control: private, max-age=60`
+
+This means the response is cacheable, but **only in a private cache**, usually the user’s browser.
+
+- `private` means shared caches should not store it.
+- `max-age=60` means it stays fresh for 60 seconds.
+
+This is useful for per-user content, like a dashboard or account summary, where caching helps the same user but the data should not be reused by other users.
+
+### 3. `Cache-Control: no-cache`
+
+This does **not** mean “do not cache at all”.
+
+It means the response may be stored, but it must be **revalidated with the server before reuse**. In other words, a cache cannot just serve the stored copy blindly.
+
+This is helpful when you want caching efficiency but also want to make sure the client always checks whether the data changed. Typically this works with `ETag` or `Last-Modified`.
+
+### 4. `Cache-Control: no-store`
+
+This means **do not store the response anywhere**.
+
+- No browser cache
+- No shared cache
+- No disk storage
+
+Use this for highly sensitive data, like one-time secrets, banking session data, or anything you never want persisted locally.
+
+### Quick mental model
+
+- `public` = cache anywhere
+- `private` = cache only for one user/client
+- `no-cache` = can cache, but must revalidate before using
+- `no-store` = do not cache at all
+
+### Why this matters
+
+These directives help balance:
+- **performance** by reducing repeated server calls
+- **correctness** by preventing stale or wrong data
+- **security/privacy** by avoiding unwanted storage of sensitive responses
+
+If you want, I can also explain how `Cache-Control` works together with `ETag` and `If-None-Match` using a simple request flow.
+
+##
+
+`If-None-Match` is a **conditional request header**. It means:
+
+> “Only send me the resource if its current ETag does **not** match what I already have.”
+
+So the server compares the value in `If-None-Match` with the resource’s current `ETag`.
+
+---
+
+## How the server interprets it
+
+There are two main outcomes:
+
+### 1. ETag matches
+If the server’s current ETag is the same as the one in `If-None-Match`, then the client already has the latest version.
+
+The server responds with:
+
+```http
+304 Not Modified
+```
+
+No body is sent. The client or cache reuses its stored copy.
+
+### 2. ETag does not match
+If the resource changed, the ETag is different.
+
+The server responds with:
+
+```http
+200 OK
+```
+
+and sends the new representation plus the new `ETag`.
+
+---
+
+## Example
+
+### First response
+
+```http
+GET /users/123
+```
+
+Server returns:
+
+```http
+200 OK
+ETag: "user-v1"
+
+{
+  "id": 123,
+  "name": "Alice"
+}
+```
+
+Now the client stores both:
+- the body
+- the ETag `"user-v1"`
+
+---
+
+### Later request with `If-None-Match`
+
+```http
+GET /users/123
+If-None-Match: "user-v1"
+```
+
+#### Case A: nothing changed
+Server still has version `"user-v1"`.
+
+Response:
+
+```http
+304 Not Modified
+ETag: "user-v1"
+```
+
+Meaning:
+- your cached copy is still valid
+- do not download the body again
+
+#### Case B: resource changed
+Suppose the user name changed, and the server now has:
+
+```http
+ETag: "user-v2"
+```
+
+Response:
+
+```http
+200 OK
+ETag: "user-v2"
+
+{
+  "id": 123,
+  "name": "Alice Cooper"
+}
+```
+
+Meaning:
+- your old copy is stale
+- here is the new data
+
+---
+
+## Important rule
+
+`If-None-Match` is mostly used with `GET` and `HEAD`.
+
+It is asking:
+
+> “Has this representation changed since the version I know about?”
+
+For writes, the related header is usually `If-Match`, which is used for optimistic concurrency control.
+
+---
+
+## One special case: `If-None-Match: *`
+
+This means:
+
+> “Only proceed if the resource does not already exist.”
+
+That is useful for create-if-absent behavior.
+
+Example:
+
+```http
+PUT /files/report.pdf
+If-None-Match: *
+```
+
+This says, “Create it only if there is no current file at this path.”
+
+---
+
+## Simple mental model
+
+- `ETag` = version label from the server
+- `If-None-Match` = version label the client already has
+- server compares them
+- if they match, return `304`
+- if they differ, return `200` with the new content
+
+If you want, I can also show the difference between `If-None-Match` and `If-Match` in one table.
+
+##
+
+Not exactly. The main server does **not usually keep a separate manually maintained ETag registry for every piece of data**.
+
+Instead, the server computes or assigns an ETag for the **final response representation** it sends back.
+
+## What an ETag really represents
+
+An ETag is a validator for a **specific response body**, not necessarily for a database row.
+
+So if the response is:
+
+```json
+{
+  "id": 123,
+  "name": "Alice"
+}
+```
+
+the server might generate an ETag based on:
+
+- a version number
+- a last-updated timestamp
+- a hash of the final response body
+- a hash of the underlying data used to build that response
+
+---
+
+## How it is maintained
+
+There are a few common strategies.
+
+### 1. Version field in the database
+If a resource is stored in one row or document, the simplest approach is to keep a version column:
+
+```text
+user_id | name  | email | version
+123     | Alice | a@x.com | 7
+```
+
+When the row changes, increment `version`.
+
+Then the server can create:
+
+```http
+ETag: "user-123-v7"
+```
+
+This is common for single-resource endpoints.
+
+---
+
+### 2. Hash of the response body
+The server can serialize the response and hash it.
+
+For example, if the response body changes, the hash changes, so the ETag changes.
+
+This works well when:
+- the response is generated from multiple fields
+- the response is mostly stable
+- exact byte-level identity matters
+
+But it can be expensive if the response is large.
+
+---
+
+### 3. Hash/version from underlying sources
+For complex responses built from joins or internal queries, the server often does **not** hash the final JSON every time if it is costly.
+
+Instead, it may derive the ETag from the version of the underlying data sources.
+
+Example: a `/dashboard` response may depend on:
+- user profile version
+- unread notification count version
+- recent orders version
+
+The server might compute a combined validator like:
+
+```text
+ETag = hash(user_version, notification_version, order_version)
+```
+
+If any input changes, the combined ETag changes.
+
+---
+
+## What about joins and multiple internal queries?
+
+This is where ETags become more of an **application design choice**.
+
+Suppose the endpoint is:
+
+```http
+GET /profile
+```
+
+and the response is assembled from:
+- `users` table
+- `orders` table
+- `addresses` table
+
+There are two main ways to handle it:
+
+### Option A: Compute ETag from the final response
+The server runs the joins, builds the full response, then computes a hash of the output.
+
+Pros:
+- simple to reason about
+- exact match for the response
+
+Cons:
+- expensive for large or frequently requested responses
+- you still have to execute the joins before you know the ETag
+
+### Option B: Compute ETag from source versions
+Each source has a version or timestamp, and the server combines them.
+
+Example:
+
+```text
+user_version = 7
+order_version = 19
+address_version = 3
+combined_etag = hash(7, 19, 3)
+```
+
+Pros:
+- faster than hashing the whole response
+- can avoid expensive body generation if nothing changed
+
+Cons:
+- harder to implement
+- must be careful to include every relevant source, or caches become incorrect
+
+---
+
+## Important caveat with joins
+
+If a response is built from many tables, the ETag is only correct if it reflects **all data that can affect the response**.
+
+Example:
+
+```http
+GET /orders/123/summary
+```
+
+If the summary includes:
+- order info
+- shipping status
+- payment status
+
+then the ETag must change when any of those change.
+
+If you forget to include payment status in the validator, the server might incorrectly return `304 Not Modified` even though the response should have changed.
+
+---
+
+## In practice
+
+For simple systems:
+- use a row `version`
+- or `updated_at`
+- or a hash of the final response
+
+For complex systems:
+- use a derived validator from the underlying entities
+- often backed by cache layers or precomputed metadata
+
+For very expensive aggregate endpoints:
+- sometimes people avoid ETags entirely and use a TTL cache instead
+- or they cache the assembled response and attach a version key to it
+
+---
+
+## Rule of thumb
+
+- **Single resource**: ETag from row/document version is easy
+- **Aggregated response**: ETag from combined source versions or response hash
+- **Expensive joins**: prefer derived versions or caching, not full recomputation every time
+
+---
+
+## Short answer
+
+No, the server does not usually keep a global ETag per “data object” in a universal sense. It maintains or computes an ETag for the **response representation**, and for complex responses it may derive that ETag from the versions of all underlying data sources.
+
+If you want, I can show you a concrete example of how to generate an ETag for a response built from **3 joined tables**.

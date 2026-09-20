@@ -1007,3 +1007,154 @@ For very expensive aggregate endpoints:
 No, the server does not usually keep a global ETag per “data object” in a universal sense. It maintains or computes an ETag for the **response representation**, and for complex responses it may derive that ETag from the versions of all underlying data sources.
 
 If you want, I can show you a concrete example of how to generate an ETag for a response built from **3 joined tables**.
+
+##
+
+This is a **safe update** pattern using **optimistic concurrency control**.
+
+## What it means
+
+`If-Match: "v3-9a1f"` says:
+
+> “Only perform this `PUT` if the current version of product `42` is still exactly `v3-9a1f`.”
+
+The client usually got that ETag from a previous `GET` response.
+
+---
+
+## How the server interprets it
+
+When the server receives:
+
+```http
+PUT /products/42
+If-Match: "v3-9a1f"
+```
+
+it compares `"v3-9a1f"` with the **current ETag** of `/products/42`.
+
+### If they match
+The resource has not changed since the client last saw it.
+
+So the server applies the update and returns something like:
+
+```http
+200 OK
+ETag: "v4-2b7c"
+```
+
+or sometimes:
+
+```http
+204 No Content
+```
+
+depending on whether the API returns a body.
+
+### If they do not match
+Someone else updated the product after the client read it.
+
+Then the server rejects the write with:
+
+```http
+412 Precondition Failed
+```
+
+That means the precondition in `If-Match` was not satisfied.
+
+---
+
+## Example
+
+### Step 1: Client reads the product
+
+```http
+GET /products/42
+```
+
+Response:
+
+```http
+200 OK
+ETag: "v3-9a1f"
+
+{
+  "id": 42,
+  "name": "Keyboard",
+  "price": 99
+}
+```
+
+The client stores:
+- the product data
+- the ETag `"v3-9a1f"`
+
+---
+
+### Step 2: Another user updates the product
+
+Now the server changes the product, maybe price becomes 109.  
+Its ETag changes to something like `"v4-2b7c"`.
+
+---
+
+### Step 3: Original client tries to update using the old ETag
+
+```http
+PUT /products/42
+If-Match: "v3-9a1f"
+
+{
+  "id": 42,
+  "name": "Keyboard Pro",
+  "price": 119
+}
+```
+
+#### If current ETag is still `"v3-9a1f"`
+Update succeeds.
+
+#### If current ETag is now `"v4-2b7c"`
+Update is rejected:
+
+```http
+412 Precondition Failed
+```
+
+---
+
+## Why this is useful
+
+Without `If-Match`, the client could accidentally overwrite someone else’s changes.
+
+This is the classic **lost update problem**:
+
+- Client A reads version 1
+- Client B reads version 1
+- Client B updates it to version 2
+- Client A updates using stale data and overwrites B’s changes
+
+`If-Match` prevents that by ensuring the update only applies to the version the client actually read.
+
+---
+
+## Mental model
+
+- `GET` gives you the current data and ETag
+- `PUT` or `PATCH` sends back that ETag in `If-Match`
+- server only updates if the ETag still matches
+- otherwise returns `412 Precondition Failed`
+
+---
+
+## Short summary
+
+`If-Match` means:
+
+> “Apply this write only if the resource is still in the version I know.”
+
+`412 Precondition Failed` means:
+
+> “The resource changed, so your update is based on stale data.”
+
+If you want, I can also show the difference between **`If-Match` vs `If-None-Match`** in a small table.
